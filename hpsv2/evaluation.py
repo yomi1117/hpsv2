@@ -83,66 +83,57 @@ def evaluate_rank(data_path, image_folder, model, batch_size, preprocess_val, to
     
     score = 0
     total = len(dataset)
-    all_rankings = []
-    if isinstance(model, RM.ImageReward):
-        with torch.no_grad():
-            for batch in tqdm(dataloader):
-                images, num_images, labels, texts = batch
-                images = images.to(device=device, non_blocking=True)
-                texts = texts.to(device=device, non_blocking=True)
-                num_images = num_images.to(device=device, non_blocking=True)
-                labels = labels.to(device=device, non_blocking=True)
+    all_rankings = []  
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            images, num_images, labels, texts = batch
+            images = images.to(device=device, non_blocking=True)
+            texts = texts.to(device=device, non_blocking=True)
+            num_images = num_images.to(device=device, non_blocking=True)
+            labels = labels.to(device=device, non_blocking=True)
 
-                # Process each group
-                batch_rankings = []
-                # Process images one by one since we can't split texts
-                for i in range(len(num_images)):
-                    start_idx = sum(num_images[:i].tolist())
-                    end_idx = start_idx + num_images[i]
-                    
-                    # Get current group of images and corresponding text
-                    group_images = images[start_idx:end_idx]
-                    # Convert tensor to string since ImageReward expects string input
-                    group_text = texts[i].detach().cpu().numpy().tolist()
-                    # Since tokenizer is a function, directly call it to decode
-                    group_text = tokenizer(group_text, decode=True)
-                    
-                    # Get rewards for current group
-                    group_rewards = model.score(group_text, group_images)
-                    # Convert rewards to rankings (higher reward = better rank)
-                    ranking = torch.argsort(-group_rewards).tolist()
-                    # Convert to position-based ranking
-                    position_ranking = [ranking.index(j) for j in range(len(ranking))]
-                    batch_rankings.append(position_ranking)
+            with torch.cuda.amp.autocast():
+                outputs = model(images, texts)
+                image_features, text_features, logit_scale = outputs["image_features"], outputs["text_features"], outputs["logit_scale"]
+                logits_per_image = logit_scale * image_features @ text_features.T
+                paired_logits_list = [logit[:,i] for i, logit in enumerate(logits_per_image.split(num_images.tolist()))]
 
-                all_rankings.extend(batch_rankings)
-                labels = [label.tolist() for label in labels.split(num_images.tolist())]
-                score += sum([inversion_score(batch_rankings[i], labels[i]) for i in range(len(batch_rankings))])
-    else:   
-        with torch.no_grad():
-            for batch in tqdm(dataloader):
-                images, num_images, labels, texts = batch
-                images = images.to(device=device, non_blocking=True)
-                texts = texts.to(device=device, non_blocking=True)
-                num_images = num_images.to(device=device, non_blocking=True)
-                labels = labels.to(device=device, non_blocking=True)
-
-                with torch.cuda.amp.autocast():
-                    outputs = model(images, texts)
-                    image_features, text_features, logit_scale = outputs["image_features"], outputs["text_features"], outputs["logit_scale"]
-                    logits_per_image = logit_scale * image_features @ text_features.T
-                    paired_logits_list = [logit[:,i] for i, logit in enumerate(logits_per_image.split(num_images.tolist()))]
-
-                predicted = [torch.argsort(-k) for k in paired_logits_list]
-                hps_ranking = [[predicted[i].tolist().index(j) for j in range(n)] for i,n in enumerate(num_images)]
-                labels = [label for label in labels.split(num_images.tolist())]
-                all_rankings.extend(hps_ranking)
-                score += sum([inversion_score(hps_ranking[i], labels[i]) for i in range(len(hps_ranking))])
+            predicted = [torch.argsort(-k) for k in paired_logits_list]
+            hps_ranking = [[predicted[i].tolist().index(j) for j in range(n)] for i,n in enumerate(num_images)]
+            labels = [label for label in labels.split(num_images.tolist())]
+            all_rankings.extend(hps_ranking)
+            score += sum([inversion_score(hps_ranking[i], labels[i]) for i in range(len(hps_ranking))])
     print('ranking_acc:', score/total)
     if not os.path.exists('logs'):
         os.makedirs('logs')
     with open('logs/hps_rank.json', 'w') as f:
         json.dump(all_rankings, f)
+
+def evaluate_rank_othermodels(data_path, image_folder, model, batch_size, preprocess_val, tokenizer, device):
+    meta_file = data_path + '/test.json'
+    # dataset = RankingDataset(meta_file, image_folder, preprocess_val, tokenizer)
+    dataset = RankingDataset(meta_file, image_folder, None, tokenizer)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_rank)
+    
+    all_texts = []
+    all_image_paths = []
+    all_labels = []
+    import pdb; pdb.set_trace()
+    for batch in tqdm(dataloader):
+        images, num_images, labels, texts = batch
+        
+        # Get image paths from dataset
+        start_idx = len(all_labels)
+        for i, n in enumerate(num_images.tolist()):
+            batch_labels = labels[start_idx:start_idx + n]
+            batch_paths = dataset.get_image_paths(start_idx, start_idx + n)
+            all_image_paths.extend(batch_paths)
+            all_labels.extend(batch_labels.tolist())
+            all_texts.append(texts[i])
+            start_idx += n
+            
+    return all_texts, all_image_paths, all_labels
+
 
 def collate_eval(batch):
     images = torch.stack([sample[0] for sample in batch])
@@ -331,13 +322,15 @@ def evaluate(mode: str, root_dir: str, data_path: str = os.path.join(root_path,'
         evaluate_benchmark(data_path, root_dir, model, batch_size, preprocess_val, tokenizer, device)
     elif mode == 'drawbench':
         evaluate_benchmark_DB(data_path, root_dir, model, batch_size, preprocess_val, tokenizer, device)
+    elif mode == 'rank_othermodels':
+        evaluate_rank_othermodels(data_path, root_dir, model, batch_size, preprocess_val, tokenizer, device)
     else:
         raise NotImplementedError
 
 if __name__ == '__main__':
     # Parse arguments
     parser = ArgumentParser()
-    parser.add_argument('--data-type', type=str, required=True, choices=['benchmark', 'benchmark_all', 'test', 'ImageReward', 'drawbench'])
+    parser.add_argument('--data-type', type=str, required=True, choices=['benchmark', 'benchmark_all', 'test', 'ImageReward', 'drawbench', 'rank_othermodels'])
     parser.add_argument('--data-path', type=str, required=True, help='path to dataset')
     parser.add_argument('--image-path', type=str, required=True, help='path to image files')
     parser.add_argument('--checkpoint', type=str, default=os.path.join(root_path,'HPS_v2_compressed.pt'), help='path to checkpoint')

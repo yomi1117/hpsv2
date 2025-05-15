@@ -769,7 +769,6 @@ class RankingDataset(Dataset):
         with open(meta_file, 'r') as f:
             self.table = pa.Table.from_pylist(json.load(f))
 
-    
     def __len__(self):
         return len(self.table)
 
@@ -777,7 +776,11 @@ class RankingDataset(Dataset):
         try:
             images = [self.transforms(self.open_image(os.path.join(self.image_folder, file_names))) for file_names in self.table.column('image_path')[idx].as_py()]
             label = self.table.column('rank')[idx].as_py()
-            caption = self.tokenizer(self.table.column('prompt')[idx].as_py())
+            prompt = self.table.column('prompt')[idx].as_py()
+            if self.tokenizer is not None:
+                caption = self.tokenizer(prompt)
+            else:
+                caption = prompt
             return images, label, caption
         except:
             return self.__getitem__((idx + 1) % len(self))
